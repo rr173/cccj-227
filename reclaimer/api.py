@@ -1,4 +1,5 @@
-"""对外门面：谱系导入、策略编译、计划生成、预检、执行、审计查询。
+"""对外门面：谱系导入、策略编译、计划生成、预检、执行、审计查询、
+质量隔离视图、存储费用结算。
 
 用法
 ====
@@ -13,6 +14,10 @@
     r.precheck(plan["plan_id"])
     r.execute(plan["plan_id"])
     r.audit.object_status("raw_a", 1)
+
+    bill = r.settle_storage_costs(
+        from_ts=..., to_ts=..., layer_amounts={"hot": 1234},
+        metering=iter([...]), attributions=iter([...]))
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from .planner import Planner
 from .precheck import Precheck
 from .quality import QualityView
 from .schema import initialize
+from .settlement import Settlement
 
 
 class Reclaimer:
@@ -45,6 +51,7 @@ class Reclaimer:
                                  clock=clock)
         self.audit = Audit(conn, backend=self.backend)
         self.quality = QualityView(conn, clock=clock)
+        self.settlement = Settlement(conn)
 
     # ------------------------------------------------------------ 工厂
     @classmethod
@@ -168,6 +175,28 @@ class Reclaimer:
     def quality_faults(self, snapshot_id, only_unreleased=True) -> list:
         return self.quality.faults(snapshot_id,
                                    only_unreleased=only_unreleased)
+
+    # ============================================================ 8. 结算
+    def settle_storage_costs(self, *, from_ts, to_ts, layer_amounts,
+                             metering, attributions) -> dict:
+        """把供应商按层给出的总费用拆到成本中心，返回一份账单。
+
+        - ``from_ts`` / ``to_ts``：结算期 ``[from_ts, to_ts)``（整秒）；
+        - ``layer_amounts``：每层应付的非负整数分（映射或 (层, 分) 对）；
+        - ``metering``：无序计量记录 ``(storage_layer, payload_ref,
+          start, end, bytes)``，允许一次性迭代器；
+        - ``attributions``：``(object_id, version, cost_center)``，
+          允许一次性迭代器。
+
+        返回 ``{"items": [...], "layers": [...], ...}``：每个有计量份额
+        的分摊项给出精确份额（``Fraction``）与整数分；同层各项之和恒
+        等于该层应付金额。任何输入不变量被违反都抛
+        :class:`reclaimer.errors.SettlementError`，不返回半张账单，
+        也不改写业务表。详见 ``reclaimer.settlement`` 模块文档。
+        """
+        return self.settlement.settle(
+            from_ts=from_ts, to_ts=to_ts, layer_amounts=layer_amounts,
+            metering=metering, attributions=attributions)
 
 
 __all__ = [

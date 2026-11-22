@@ -16,13 +16,15 @@ reclaimer/                 产品代码（仅标准库，无第三方依赖）
   executor.py              叶序删除、失败重试、崩溃恢复、墓碑、引用计数级联
   audit.py                 审计查询：LIVE / RECYCLED / UNKNOWN 三态、证据
   quality.py               分区质量隔离视图（区间元数据，不删数据）
-  api.py                   门面 Reclaimer（六个对外接口 + 质量视图接口）
+  settlement.py            存储费用结算：按层与成本中心拆账（精确分数）
+  api.py                   门面 Reclaimer（六个对外接口 + 质量视图 + 结算）
   errors.py                领域异常
 tests/
   scenario.py              手工场景与逐对象手工期望集合
   oracle.py                独立参考程序（不 import 任何产品代码）
   test_reclaimer.py        106 项断言
   test_quality_view.py     132 项质量隔离断言 + 逐分区参考模型
+  test_settlement.py       82 项结算断言（手算账单 + 按秒 oracle + 高共享度）
   demo.py                  端到端演示
   demo_quality.py          质量隔离演示（逐分区展开）
 ```
@@ -187,6 +189,56 @@ r.quality_ranges("snap-1", "join", 1)
 变化相交的映射；节点并集没变就不向后继传播。10^9 规模的长区间也只存
 一个端点区间，不受影响的大支路不参与单次更新。
 
+## 7c. 存储费用结算（`Reclaimer.settle_storage_costs`）
+
+供应商只按存储层给出结算期内的总费用，本接口把费用拆到账户所属的成本
+中心，一次返回一份可与供应商金额对平的账单。共享同一物理内容
+（相同 `(storage_layer, payload_ref)`）的多个逻辑版本不各算一份存储；
+已回收版本的历史引用仍参与历史账单（不按今天的 LIVE 状态过滤）。
+
+```python
+bill = r.settle_storage_costs(
+    from_ts=0, to_ts=100,                  # 结算期 [from_ts, to_ts)
+    layer_amounts={"hot": 2},              # 每层应付的非负整数分
+    metering=iter([                        # 无序计量记录，可一次性迭代器
+        ("hot", "p-shared", 0, 40, 10),    # (层, payload_ref, start, end, bytes)
+        ("hot", "p-shared", 40, 70, 20),
+        ("hot", "p-shared", 80, 100, 15),  # 段间空档 [70,80) 不计费
+    ]),
+    attributions=iter([                    # (object_id, version, 成本中心)
+        ("A", 1, "cc-x"), ("A", 2, "cc-x"), ("B", 1, "cc-y"),
+    ]),
+)
+# bill["items"]  -> 每个有计量份额的分摊项：
+#                   {storage_layer, cost_center(None=未归属), unattributed,
+#                    share(Fraction 精确份额), cents(整数分)}
+# bill["layers"] -> 每层应付/已分摊/份额总量；同层各项之和恒等于应付金额
+```
+
+规则要点：
+
+- **引用区间**：目录中相同 `(层, payload_ref)` 的对象版本，以
+  `created_at` 为始、已回收版本以 `recycled_at` 为终、存活版本以
+  `to_ts` 为终；目录事实取自同一份 SQLite 读取快照（单个事务）。
+- **均分**：引用集合与字节数不变的时间段内，“字节数 × 秒数”均分给
+  当时所有**不同**的成本中心（同中心多版本同时引用只算一个）；
+  计量有效而无任何引用的时间进入专门的“未归属”项。
+- **归属约束**：只在引用与计量同时有效的时间内要求该版本有归属；
+  缺失即整次拒绝（`SettlementError`），不悄悄转嫁。
+- **取整**：先按层汇总整个结算期的精确份额（`Fraction`，无浮点），
+  再按该层应付总额换算：各项向下取整，余下的分按小数余数从大到小
+  补发（每项最多一分）；余数并列按中心名 Unicode 码点序，未归属项
+  排在同余数普通中心之后。
+- **失败语义**：无效区间、负金额、计量层缺少应付金额、正费用层没有
+  任何计量、段为空/越界/字节数非正、同一物理内容计量重叠、归属未知
+  版本、同版本重复归属——整次调用报错，不返回半张账单，不改写业务表。
+- **性能**：计量与归属流入 TEMP 暂存表由 SQLite 排序，Python 侧按
+  内容归并两条有序流（同一时刻只持有一份物理内容的段与引用）；单份
+  内容内把计量段归并进 O(引用数) 个“引用集合恒定”的 span 再整体
+  分摊——不按秒展开，工作量不随秒数或“计量段数 × 活跃中心数”增长；
+  字节秒中间总量可超 SQLite 64 位整数（TEXT 暂存 + Python 大整数）。
+
+
 ## 8. 测试方法
 
 ```bash
@@ -195,6 +247,9 @@ python3 -I tests/test_reclaimer.py
 
 # 132 项质量隔离断言（含独立逐分区参考模型）
 python3 -I tests/test_quality_view.py
+
+# 82 项结算断言（手算跨回收账单 + 按秒独立核算 + 高共享度精确核对）
+python3 -I tests/test_settlement.py
 
 # 端到端演示：回收计划器 / 质量隔离视图
 python3 -I tests/demo.py
