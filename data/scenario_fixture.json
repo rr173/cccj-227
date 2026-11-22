@@ -1,0 +1,245 @@
+{
+  "as_of_ts": 10000000,
+  "consumers": [
+    {
+      "consumer_id": "c-bi",
+      "description": "BI 报表（低水位）"
+    },
+    {
+      "consumer_id": "c-ml",
+      "description": "ML 特征（高水位）"
+    }
+  ],
+  "edges": [
+    {
+      "dst_id": "raw_a",
+      "dst_version": 1,
+      "src_id": "t1",
+      "src_version": 1
+    },
+    {
+      "dst_id": "raw_a",
+      "dst_version": 2,
+      "src_id": "t1",
+      "src_version": 2
+    },
+    {
+      "dst_id": "raw_b",
+      "dst_version": 1,
+      "src_id": "t1",
+      "src_version": 2
+    },
+    {
+      "dst_id": "t1",
+      "dst_version": 1,
+      "src_id": "m1",
+      "src_version": 1
+    },
+    {
+      "dst_id": "t1",
+      "dst_version": 2,
+      "src_id": "m1",
+      "src_version": 1
+    },
+    {
+      "dst_id": "m1",
+      "dst_version": 1,
+      "src_id": "m2",
+      "src_version": 1
+    },
+    {
+      "dst_id": "m1",
+      "dst_version": 1,
+      "src_id": "audit_ev",
+      "src_version": 1
+    }
+  ],
+  "hold_releases": [],
+  "holds": [
+    {
+      "applied_at": 1005000,
+      "hold_id": "hold-m2",
+      "object_id": "m2",
+      "reason": "legal matter LM-2026-007",
+      "version": 1
+    }
+  ],
+  "interests": [
+    {
+      "consumer_id": "c-bi",
+      "object_id": "t1"
+    },
+    {
+      "consumer_id": "c-bi",
+      "object_id": "m1"
+    },
+    {
+      "consumer_id": "c-ml",
+      "object_id": "m1"
+    },
+    {
+      "consumer_id": "c-ml",
+      "object_id": "m2"
+    },
+    {
+      "consumer_id": "c-ml",
+      "object_id": "raw_a"
+    }
+  ],
+  "objects": [
+    {
+      "classification": "confidential",
+      "created_at": 1000100,
+      "environment": "prod",
+      "obj_type": "raw_file",
+      "object_id": "raw_a",
+      "payload_ref": "hot://raw_a/v1",
+      "storage_layer": "hot",
+      "version": 1
+    },
+    {
+      "classification": "confidential",
+      "created_at": 1000200,
+      "environment": "prod",
+      "obj_type": "raw_file",
+      "object_id": "raw_a",
+      "payload_ref": "warm://raw_a/v2",
+      "storage_layer": "warm",
+      "version": 2
+    },
+    {
+      "classification": "internal",
+      "created_at": 1000300,
+      "environment": "prod",
+      "obj_type": "raw_file",
+      "object_id": "raw_b",
+      "payload_ref": "warm://raw_b/v1",
+      "storage_layer": "warm",
+      "version": 1
+    },
+    {
+      "classification": "public",
+      "created_at": 1000400,
+      "environment": "prod",
+      "obj_type": "raw_file",
+      "object_id": "raw_c",
+      "payload_ref": "cold://raw_c/v1",
+      "storage_layer": "cold",
+      "version": 1
+    },
+    {
+      "classification": "confidential",
+      "created_at": 1001100,
+      "environment": "prod",
+      "obj_type": "table",
+      "object_id": "t1",
+      "payload_ref": "hot://t1/v1",
+      "storage_layer": "hot",
+      "version": 1
+    },
+    {
+      "classification": "confidential",
+      "created_at": 1001200,
+      "environment": "prod",
+      "obj_type": "table",
+      "object_id": "t1",
+      "payload_ref": "hot://t1/v2",
+      "storage_layer": "hot",
+      "version": 2
+    },
+    {
+      "classification": "confidential",
+      "created_at": 1002100,
+      "environment": "prod",
+      "obj_type": "metric",
+      "object_id": "m1",
+      "payload_ref": "hot://m1/v1",
+      "storage_layer": "hot",
+      "version": 1
+    },
+    {
+      "classification": "internal",
+      "created_at": 1002200,
+      "environment": "prod",
+      "obj_type": "metric",
+      "object_id": "m2",
+      "payload_ref": "hot://m2/v1",
+      "storage_layer": "hot",
+      "version": 1
+    },
+    {
+      "classification": "confidential",
+      "created_at": 1003100,
+      "environment": "prod",
+      "obj_type": "audit_evidence",
+      "object_id": "audit_ev",
+      "payload_ref": "audit://audit_ev/v1",
+      "storage_layer": "audit",
+      "version": 1
+    }
+  ],
+  "policy_rules": [
+    {
+      "classification": null,
+      "environment": null,
+      "obj_type": "raw_file",
+      "retention_seconds": 10000000,
+      "rule_id": "rule-raw_file"
+    },
+    {
+      "classification": null,
+      "environment": null,
+      "obj_type": "table",
+      "retention_seconds": 8000000,
+      "rule_id": "rule-table"
+    },
+    {
+      "classification": null,
+      "environment": null,
+      "obj_type": "metric",
+      "retention_seconds": 7000000,
+      "rule_id": "rule-metric"
+    },
+    {
+      "classification": null,
+      "environment": null,
+      "obj_type": "audit_evidence",
+      "retention_seconds": 20000000,
+      "rule_id": "rule-audit_evidence"
+    },
+    {
+      "classification": "public",
+      "environment": null,
+      "obj_type": "raw_file",
+      "retention_seconds": 3000000,
+      "rule_id": "rule-public-raw"
+    }
+  ],
+  "watermarks": [
+    {
+      "consumer_id": "c-bi",
+      "min_version": 2,
+      "object_id": "t1"
+    },
+    {
+      "consumer_id": "c-bi",
+      "min_version": 1,
+      "object_id": "m1"
+    },
+    {
+      "consumer_id": "c-ml",
+      "min_version": 1,
+      "object_id": "m1"
+    },
+    {
+      "consumer_id": "c-ml",
+      "min_version": 1,
+      "object_id": "m2"
+    },
+    {
+      "consumer_id": "c-ml",
+      "min_version": 2,
+      "object_id": "raw_a"
+    }
+  ]
+}
