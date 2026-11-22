@@ -26,6 +26,7 @@ from .executor import Executor, MemoryBackend, StorageBackend
 from .importer import Importer
 from .planner import Planner
 from .precheck import Precheck
+from .quality import QualityView
 from .schema import initialize
 
 
@@ -43,6 +44,7 @@ class Reclaimer:
         self.executor = Executor(conn, self.backend, self.planner,
                                  clock=clock)
         self.audit = Audit(conn, backend=self.backend)
+        self.quality = QualityView(conn, clock=clock)
 
     # ------------------------------------------------------------ 工厂
     @classmethod
@@ -135,6 +137,37 @@ class Reclaimer:
 
     def evidence_for(self, object_id, version, plan_id=None) -> list:
         return self.audit.evidence_for(object_id, version, plan_id=plan_id)
+
+    # ============================================================ 7. 质量隔离
+    def register_quality_view(self, snapshot_id, objects, mappings=()) -> dict:
+        """为已导入快照登记固定分区映射。
+
+        ``objects``: ``{"object_id", "version", "partition_count"}`` 列表；
+        ``mappings``: ``{"src_id", "src_version", "dst_id", "dst_version",
+        "read": [start, end], "out": [start, end]}`` 列表。``src`` 依赖
+        ``dst``（库内既有方向），坏数从 ``dst`` 传给 ``src``。
+        """
+        return self.quality.register(snapshot_id, objects, mappings)
+
+    def report_quality_fault(self, snapshot_id, fault_id, object_id,
+                             version, range_start, range_end) -> dict:
+        """提交一条带编号的报障，返回受影响节点与本次更新量。"""
+        return self.quality.report(
+            snapshot_id, fault_id, object_id, version, range_start, range_end)
+
+    def release_quality_fault(self, snapshot_id, fault_id,
+                              release_ref=None) -> dict:
+        """按编号解除报障；重复解除幂等。"""
+        return self.quality.release(
+            snapshot_id, fault_id, release_ref=release_ref)
+
+    def quality_ranges(self, snapshot_id, object_id, version) -> dict:
+        """查询供数时必须避开的分区区间（三态：AVAILABLE/RECYCLED/NO_VIEW）。"""
+        return self.quality.isolated_ranges(snapshot_id, object_id, version)
+
+    def quality_faults(self, snapshot_id, only_unreleased=True) -> list:
+        return self.quality.faults(snapshot_id,
+                                   only_unreleased=only_unreleased)
 
 
 __all__ = [

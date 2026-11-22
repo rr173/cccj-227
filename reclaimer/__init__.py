@@ -9,10 +9,18 @@
 - ``precheck``   : 执行前重新验证绑定输入，变化则暂停并生成差异
 - ``executor``   : 分批次叶序删除、失败重试、进程退出恢复
 - ``audit``      : 审计查询（对象状态、证据、计划、差异、事件）
+- ``quality``    : 分区质量隔离视图（区间元数据，不删数据）
 - ``api``        : 对外门面 ``Reclaimer``
 """
 
 from .api import Reclaimer
+from .quality import (
+    QUALITY_AVAILABLE,
+    QUALITY_NO_VIEW,
+    QUALITY_RECYCLED,
+    QualityView,
+)
 
-__all__ = ["Reclaimer"]
+__all__ = ["Reclaimer", "QualityView", "QUALITY_AVAILABLE",
+           "QUALITY_RECYCLED", "QUALITY_NO_VIEW"]
 __version__ = "1.0.0"

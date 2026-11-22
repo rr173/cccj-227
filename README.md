@@ -15,13 +15,16 @@ reclaimer/                 产品代码（仅标准库，无第三方依赖）
   precheck.py              执行前重算指纹并比对，漂移即暂停并落差异
   executor.py              叶序删除、失败重试、崩溃恢复、墓碑、引用计数级联
   audit.py                 审计查询：LIVE / RECYCLED / UNKNOWN 三态、证据
-  api.py                   门面 Reclaimer（六个对外接口）
+  quality.py               分区质量隔离视图（区间元数据，不删数据）
+  api.py                   门面 Reclaimer（六个对外接口 + 质量视图接口）
   errors.py                领域异常
 tests/
   scenario.py              手工场景与逐对象手工期望集合
   oracle.py                独立参考程序（不 import 任何产品代码）
-  test_reclaimer.py        97 项断言、15 个测试
+  test_reclaimer.py        106 项断言
+  test_quality_view.py     132 项质量隔离断言 + 逐分区参考模型
   demo.py                  端到端演示
+  demo_quality.py          质量隔离演示（逐分区展开）
 ```
 
 ## 2. 阶段状态机
@@ -115,14 +118,87 @@ r.object_status("raw_c", 1)             # 6. 审计查询
 r.evidence_for("t1", 1, plan["plan_id"])
 ```
 
+## 7b. 分区质量隔离视图（`Reclaimer.quality_*`）
+
+下游发现坏数时，只需停用**少数分区**，而不是整张下游表。质量视图只维护
+元数据：不读数据文件、不删除数据、不改变任何回收规则。
+
+**坐标**：区间 `[start, end)` 的坐标是**对象版本内的分区序号**，不是版本号。
+每个登记对象版本声明分区总数，合法区间是 `[0, partition_count)` 内的非空
+整数半开区间。
+
+**登记固定映射**（每个快照一份；快照之间完全隔离）：
+
+```python
+r.register_quality_view(
+    snapshot_id="snap-1",
+    objects=[                      # 参与对象版本 + 分区总数
+        {"object_id": "raw",  "version": 1, "partition_count": 8},
+        {"object_id": "a",    "version": 1, "partition_count": 8},
+        {"object_id": "join", "version": 1, "partition_count": 8},
+        {"object_id": "solo", "version": 1, "partition_count": 4},
+    ],
+    mappings=[                     # 每条快照边至少一条；可交叠、不必铺满
+        {"src_id": "a", "src_version": 1,          # 派生对象
+         "dst_id": "raw", "dst_version": 1,        # 被读取的上游
+         "read": [0, 4],                           # 上游读取区间
+         "out":  [0, 4]},                          # 下游产出区间
+        {"src_id": "join", "src_version": 1,
+         "dst_id": "a", "dst_version": 1,
+         "read": [0, 4], "out": [0, 2]},
+    ],
+)
+```
+
+方向沿用库里既有 `lineage_edges`：`src` 依赖 `dst`，坏数从 `dst` 传给
+`src`。读取区间内任何分区被隔离，对应产出区间**整体**隔离。登记时校验
+端点已在库内、每条快照边至少一条映射、区间非空且不越界；无效定义不会
+留下半份映射。除边的端点外，也可登记库内已知但该快照没有边的对象版本。
+
+**报障与解除**（一次调用内原子生效，含全部下游变化）：
+
+```python
+r.report_quality_fault("snap-1", "INC-42", "raw", 1, 1, 5)
+# -> {"status": "reported", "intervals": [[1, 5]], "stats": {...}}
+r.release_quality_fault("snap-1", "INC-42")      # 确认修复
+```
+
+- 编号在快照内唯一；重发同一报障返回 `duplicate` 且无变化，重复解除返回
+  `already-released`；**重放已解除的旧报障不会重新激活**；同编号换载荷
+  或解除未知编号抛 `QualityFaultError`。
+- 一个节点的隔离范围 = 自身未解除报障 ∪ 所有命中的上游映射产出区间，
+  并沿派生链传到下游；多路汇合取并集，不同故障可覆盖同一分区。
+- 解除只移除**失去全部支持**的部分：若另一条故障或另一条活跃映射仍覆盖
+  该区间，它保持隔离。
+- 已回收版本仍可作为质量归因上游：回收不自动解除它对存活下游的影响。
+
+**查询**（供数程序按对象版本取当前必须避开的区间）：
+
+```python
+r.quality_ranges("snap-1", "join", 1)
+# {"status": "AVAILABLE", "intervals": [[0, 2], [4, 6]], ...}
+# 空列表 [] 只表示“已登记且当前可读”的版本没有质量隔离。
+# status="RECYCLED"  -> 版本已回收，不可当成可供数（intervals=None）；
+# status="NO_QUALITY_VIEW" -> 快照/版本未登记质量视图。
+```
+
+**性能组织**：隔离区间、报障、映射贡献都按端点存储；节点当前区间是各
+“支持”区间的并集，查询只读物化结果。报障/解除只检查读取区间与本次
+变化相交的映射；节点并集没变就不向后继传播。10^9 规模的长区间也只存
+一个端点区间，不受影响的大支路不参与单次更新。
+
 ## 8. 测试方法
 
 ```bash
-# 97 项断言（-I 隔离模式，不信任工作目录中的模块）
+# 106 项断言（-I 隔离模式，不信任工作目录中的模块）
 python3 -I tests/test_reclaimer.py
 
-# 端到端演示
+# 132 项质量隔离断言（含独立逐分区参考模型）
+python3 -I tests/test_quality_view.py
+
+# 端到端演示：回收计划器 / 质量隔离视图
 python3 -I tests/demo.py
+python3 -I tests/demo_quality.py
 ```
 
 ### 手工场景（tests/scenario.py）
@@ -162,3 +238,26 @@ raw_c v1（孤立对象，public 短保留期规则命中）
 - `test_cascade_unblock_shared_parent` /
   `test_shared_parent_refcount_cascade`：叶序、引用计数级联、共享父节点；
 - `test_large_graph_bounded_batches`：2500 对象下有界批次与分计划回收。
+
+### 质量隔离测试（tests/test_quality_view.py）
+
+- `test_registration_validation_and_atomicity`：未知快照/对象、重复声明、
+  缺端点、缺映射、快照外边、空/越界/非整数区间全部拒绝，且不留半份映射；
+- `test_convergence_partial_release_and_boundaries`：汇合分支 a/b -> join，
+  半开边界 `[3,4)`/`[4,5)`、同节点直接报障、重合报障不传播、部分解封；
+  每一步都与 `PartitionReference`（不 import 产品代码的逐分区展开模型）
+  逐对象区间核对；
+- `test_fault_idempotency_and_conflicts`：重复投递、重复解除、旧报障重放、
+  同编号换载荷、解除未知编号，以及不同故障覆盖同一分区时的部分解封；
+- `test_snapshots_are_isolated`：同编号报障与相近映射在两个快照互不影响；
+- `test_recycled_semantics`：已回收版本明确返回 `RECYCLED`；已回收上游
+  仍把隔离传给存活下游，解除报障后才停止归因；
+- `test_crash_mid_write_reopen_reads_old_result`：写第二条支持时抛错，
+  当前连接与重新打开的文件库都读到旧提交，且失败报障可重新提交；
+- `test_long_interval_and_large_branch_bounded_update`：10^9 长区间与
+  400 叶大支路并存，单次报障/解除只改 2 个节点、只检查 1 条映射，
+  更新量不随无关支路规模增长。
+
+`tests/demo_quality.py` 用小坐标把每个版本逐分区展开（`X` = 必须避开），
+演示报障、重复投递、同编号换载荷、解除未知编号、部分解封、全部解除后与
+参考模型一致，以及写到一半失败后重开仍读旧结果。

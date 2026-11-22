@@ -39,3 +39,19 @@ class PlanNotExecutableError(ReclaimerError):
 
 class ObjectUnknownError(ReclaimerError):
     """查询的对象身份在任何快照中都不存在（区别于“已回收”）。"""
+
+
+class QualityValidationError(ReclaimerError):
+    """分区质量视图登记或查询参数违反不变量。
+
+    包括：快照未导入、快照外的边、缺少映射、端点未声明、区间越界或
+    为空等。无效定义不会在库中留下任何半份映射。
+    """
+
+
+class QualityFaultError(ReclaimerError):
+    """报障编号冲突或指向未知报障。
+
+    - 同一快照内同一编号换载荷（对象/版本/区间不同）→ 冲突；
+    - 解除一个从未登记的编号 → 未知。
+    """

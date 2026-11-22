@@ -9,6 +9,8 @@
    ``objects`` 上的触发器保证 ``RECYCLED`` 是终态——任何进程都不能
    把已经删除的对象重新标成 ``LIVE``。
 4. 所有图遍历都用递归 CTE 在 SQLite 内完成，应用层不全图驻留内存。
+5. 分区质量隔离（``quality_*``）是独立元数据层：坐标是对象版本内的分区
+   序号，只按区间端点存储与计算；不删除数据，也不改变回收规则。
 """
 
 # 计划阶段机
@@ -256,6 +258,119 @@ CREATE TABLE IF NOT EXISTS audit_events (
     version       INTEGER,
     detail        TEXT NOT NULL
 );
+
+-- ================================================================
+-- 分区质量隔离视图（只维护元数据，不读取/删除数据文件）
+--
+-- 坐标是“对象版本内的分区序号”，不是版本号。非法分区以半开区间
+-- [range_start, range_end) 表示，所有区间端点都是整数，计算与存储
+-- 只依赖端点，不按区间长度枚举分区。
+-- ================================================================
+CREATE TABLE IF NOT EXISTS quality_views (
+    snapshot_id   TEXT PRIMARY KEY
+                  REFERENCES lineage_snapshots(snapshot_id),
+    registered_at INTEGER NOT NULL
+);
+
+-- 每个参与对象版本声明分区总数；可登记快照中没有边的已知对象版本。
+CREATE TABLE IF NOT EXISTS quality_objects (
+    snapshot_id     TEXT NOT NULL REFERENCES quality_views(snapshot_id),
+    object_id       TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    partition_count INTEGER NOT NULL CHECK (partition_count >= 1),
+    PRIMARY KEY (snapshot_id, object_id, version)
+);
+
+-- 一条映射绑定快照内的一条真实依赖边：
+--   上游 dst 的读取区间 read_* 命中隔离 -> 下游 src 的产出区间 out_* 全隔离
+-- 同一条边允许有多条交叠映射；不要求映射铺满对象。
+CREATE TABLE IF NOT EXISTS quality_mappings (
+    mapping_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id   TEXT NOT NULL REFERENCES quality_views(snapshot_id),
+    src_id        TEXT NOT NULL,
+    src_version   INTEGER NOT NULL,
+    dst_id        TEXT NOT NULL,
+    dst_version   INTEGER NOT NULL,
+    read_start    INTEGER NOT NULL,
+    read_end      INTEGER NOT NULL,
+    out_start     INTEGER NOT NULL,
+    out_end       INTEGER NOT NULL,
+    active        INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0,1)),
+    CHECK (read_start >= 0 AND read_end > read_start),
+    CHECK (out_start >= 0 AND out_end > out_start),
+    FOREIGN KEY (snapshot_id, src_id, src_version)
+        REFERENCES quality_objects(snapshot_id, object_id, version),
+    FOREIGN KEY (snapshot_id, dst_id, dst_version)
+        REFERENCES quality_objects(snapshot_id, object_id, version),
+    FOREIGN KEY (snapshot_id, src_id, src_version,
+                 dst_id, dst_version)
+        REFERENCES lineage_edges(snapshot_id, src_id, src_version,
+                                 dst_id, dst_version)
+);
+CREATE INDEX IF NOT EXISTS idx_qmap_read
+    ON quality_mappings(snapshot_id, dst_id, dst_version,
+                        read_start, read_end);
+CREATE INDEX IF NOT EXISTS idx_qmap_out
+    ON quality_mappings(snapshot_id, src_id, src_version,
+                        out_start, out_end);
+
+-- 报障记录。编号在快照内唯一；released_at 非空表示已解除，但记录
+-- 永久保留，用于重放幂等与历史追溯。
+CREATE TABLE IF NOT EXISTS quality_faults (
+    snapshot_id   TEXT NOT NULL REFERENCES quality_views(snapshot_id),
+    fault_id      TEXT NOT NULL,
+    object_id     TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    range_start   INTEGER NOT NULL,
+    range_end     INTEGER NOT NULL,
+    payload_hash  TEXT NOT NULL,
+    reported_at   INTEGER NOT NULL,
+    released_at   INTEGER,
+    release_ref   TEXT,
+    PRIMARY KEY (snapshot_id, fault_id),
+    CHECK (range_start >= 0 AND range_end > range_start),
+    FOREIGN KEY (snapshot_id, object_id, version)
+        REFERENCES quality_objects(snapshot_id, object_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_qfault_node
+    ON quality_faults(snapshot_id, object_id, version, released_at);
+
+-- 区间级“支持”台账：节点当前隔离集合 = 其全部支持区间的并集。
+--   FAULT   : 未解除报障直接贡献的区间（source_key = fault_id）
+--   MAPPING : 上游读取区间仍命中隔离时，映射产出区间对下游的贡献
+-- 解除报障 / 映射失活只删除对应支持；其它支持仍覆盖的区间不会解封。
+CREATE TABLE IF NOT EXISTS quality_supports (
+    snapshot_id   TEXT NOT NULL REFERENCES quality_views(snapshot_id),
+    object_id     TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    source_kind   TEXT NOT NULL CHECK (source_kind IN ('FAULT','MAPPING')),
+    source_key    TEXT NOT NULL,
+    range_start   INTEGER NOT NULL,
+    range_end     INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, source_kind, source_key),
+    CHECK (range_start >= 0 AND range_end > range_start),
+    FOREIGN KEY (snapshot_id, object_id, version)
+        REFERENCES quality_objects(snapshot_id, object_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_qsupport_node
+    ON quality_supports(snapshot_id, object_id, version);
+
+-- 物化的当前隔离区间。查询直接读本表；报障/解除时增量维护。
+-- 同一节点内区间规范化为不相交且不相邻。
+CREATE TABLE IF NOT EXISTS quality_isolated_ranges (
+    snapshot_id   TEXT NOT NULL REFERENCES quality_views(snapshot_id),
+    object_id     TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    range_start   INTEGER NOT NULL,
+    range_end     INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, object_id, version, range_start),
+    CHECK (range_start >= 0 AND range_end > range_start),
+    FOREIGN KEY (snapshot_id, object_id, version)
+        REFERENCES quality_objects(snapshot_id, object_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_qrange_lookup
+    ON quality_isolated_ranges(snapshot_id, object_id, version,
+                               range_start, range_end);
 
 -- ================================================================
 -- 状态机触发器
