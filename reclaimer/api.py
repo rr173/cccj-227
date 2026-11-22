@@ -26,6 +26,7 @@ import sqlite3
 import time
 
 from .audit import Audit
+from .catalog import CatalogMirror, CatalogProducer
 from .errors import PlanPausedError
 from .executor import Executor, MemoryBackend, StorageBackend
 from .importer import Importer
@@ -39,9 +40,12 @@ from .settlement import Settlement
 class Reclaimer:
     def __init__(self, conn: sqlite3.Connection,
                  backend: StorageBackend | None = None,
-                 clock=time.time):
+                 clock=time.time, db_path: str | None = None):
         self.conn = conn
         self._clock = clock
+        # 文件库路径用于打开独立只读快照连接；:memory: 库为 None，
+        # 交付在同一连接的只读事务内产出。
+        self.db_path = db_path
         initialize(conn)
         self.importer = Importer(conn, clock=clock)
         self.planner = Planner(conn, clock=clock)
@@ -52,6 +56,7 @@ class Reclaimer:
         self.audit = Audit(conn, backend=self.backend)
         self.quality = QualityView(conn, clock=clock)
         self.settlement = Settlement(conn)
+        self.catalog_producer = CatalogProducer(conn, db_path=db_path)
 
     # ------------------------------------------------------------ 工厂
     @classmethod
@@ -59,14 +64,14 @@ class Reclaimer:
              clock=time.time) -> "Reclaimer":
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA foreign_keys=ON")
-        return cls(conn, backend=backend, clock=clock)
+        return cls(conn, backend=backend, clock=clock, db_path=db_path)
 
     @classmethod
     def in_memory(cls, backend: StorageBackend | None = None,
                   clock=time.time) -> "Reclaimer":
         conn = sqlite3.connect(":memory:")
         conn.execute("PRAGMA foreign_keys=ON")
-        return cls(conn, backend=backend, clock=clock)
+        return cls(conn, backend=backend, clock=clock, db_path=None)
 
     def close(self) -> None:
         self.conn.close()
@@ -197,6 +202,39 @@ class Reclaimer:
         return self.settlement.settle(
             from_ts=from_ts, to_ts=to_ts, layer_amounts=layer_amounts,
             metering=metering, attributions=attributions)
+
+    # ============================================================ 9. 目录镜像交付
+    def catalog_source_id(self) -> str:
+        """本主库随重开保持的来源标识。"""
+        return self.catalog_producer.source_id()
+
+    def catalog_latest_batch(self) -> int:
+        """主库当前最大已提交目录批次号（无变更时为 0）。"""
+        return self.catalog_producer.latest_batch_no()
+
+    def open_full_catalog_delivery(self):
+        """完整目录交付（首次交付/重基线）。
+
+        返回上下文管理器：header 含来源标识、基准批次号、总行数；
+        ``iter_chunks(chunk_size)`` 流式产出目录行并在迭代完成后给出
+        摘要。基准号与全量目录取自同一个已提交快照。
+        """
+        return self.catalog_producer.open_full_delivery()
+
+    def open_incremental_catalog_delivery(self, after_batch: int,
+                                          max_batches: int):
+        """增量交付：批次号 ``(after_batch, after_batch+max_batches]``。
+
+        整批不拆；返回对象的 header 注明来源、起止进度与各批记录数，
+        ``iter_chunks`` 可把大批切块，块末带批摘要。
+        """
+        return self.catalog_producer.open_incremental_delivery(
+            after_batch, max_batches)
+
+    @staticmethod
+    def open_catalog_mirror(db_path: str, write_fault=None) -> CatalogMirror:
+        """打开（或创建）盘点服务侧的目录镜像库。"""
+        return CatalogMirror.open(db_path, write_fault=write_fault)
 
 
 __all__ = [

@@ -373,6 +373,49 @@ CREATE INDEX IF NOT EXISTS idx_qrange_lookup
                                range_start, range_end);
 
 -- ================================================================
+-- 目录镜像变更序列（供盘点服务镜像，不复制对象文件/计划/谱系/质量/账单）
+--
+-- 只有两个目录写入口会追加批次：importer 的成功对象导入（IMPORT）与
+-- executor 成功提交的回收（RECYCLE）。批次号在写事务内按 MAX+1 分配，
+-- 回滚的事务不留任何痕迹，因此已提交批次按提交顺序从 1 连续编号。
+-- catalog_changes 保存该批次写入后的完整目录行（非增量 diff），接收端
+-- 直接 UPSERT 即可；保留历史所需存储随写入量增长。
+-- ================================================================
+CREATE TABLE IF NOT EXISTS catalog_batches (
+    batch_no      INTEGER PRIMARY KEY,      -- 提交顺序，从 1 连续
+    change_kind   TEXT NOT NULL CHECK (change_kind IN ('IMPORT','RECYCLE')),
+    committed_at  INTEGER NOT NULL,
+    row_count     INTEGER NOT NULL CHECK (row_count >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS catalog_changes (
+    batch_no       INTEGER NOT NULL REFERENCES catalog_batches(batch_no),
+    seq_in_batch   INTEGER NOT NULL,
+    object_id      TEXT NOT NULL,
+    version        INTEGER NOT NULL,
+    obj_type       TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    environment    TEXT NOT NULL,
+    storage_layer  TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    lifecycle      TEXT NOT NULL,
+    recycled_at    INTEGER,
+    recycled_by_plan TEXT,
+    payload_ref    TEXT,
+    PRIMARY KEY (batch_no, seq_in_batch)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_changes_batch
+    ON catalog_changes(batch_no, object_id, version);
+
+-- 主库来源标识：单行，initialize 时补写，随库重开保持。
+-- 镜像端据此拒绝来源不同的交付。
+CREATE TABLE IF NOT EXISTS catalog_source (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    source_id      TEXT NOT NULL,
+    initialized_at INTEGER NOT NULL
+);
+
+-- ================================================================
 -- 状态机触发器
 -- ================================================================
 
@@ -417,6 +460,23 @@ END;
 
 
 def initialize(conn) -> None:
-    """建表、建索引、建触发器（幂等）。"""
+    """建表、建索引、建触发器（幂等）。
+
+    对从旧版本升级的现有数据库：只补建镜像变更表，并为本库补写一份
+    来源标识。升级前已存在的对象与墓碑不倒推旧变更——它们通过第一次
+    完整交付进入镜像。
+    """
+    import time
+    import uuid
+
     conn.executescript(SCHEMA_SQL)
+    existing = conn.execute(
+        "SELECT 1 FROM catalog_source WHERE id=1"
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO catalog_source(id, source_id, initialized_at)"
+            " VALUES(1,?,?)",
+            (f"src-{uuid.uuid4().hex}", int(time.time())),
+        )
     conn.commit()

@@ -17,7 +17,8 @@ reclaimer/                 产品代码（仅标准库，无第三方依赖）
   audit.py                 审计查询：LIVE / RECYCLED / UNKNOWN 三态、证据
   quality.py               分区质量隔离视图（区间元数据，不删数据）
   settlement.py            存储费用结算：按层与成本中心拆账（精确分数）
-  api.py                   门面 Reclaimer（六个对外接口 + 质量视图 + 结算）
+  catalog.py               目录镜像：主库变更序列 + 完整/增量交付 + 镜像接收
+  api.py                   门面 Reclaimer（六个对外接口 + 质量视图 + 结算 + 镜像）
   errors.py                领域异常
 tests/
   scenario.py              手工场景与逐对象手工期望集合
@@ -25,8 +26,10 @@ tests/
   test_reclaimer.py        106 项断言
   test_quality_view.py     132 项质量隔离断言 + 逐分区参考模型
   test_settlement.py       82 项结算断言（手算账单 + 按秒 oracle + 高共享度）
+  test_catalog_mirror.py   121 项目录镜像断言（变更序列/交付/崩溃/并发/性能证据）
   demo.py                  端到端演示
   demo_quality.py          质量隔离演示（逐分区展开）
+  demo_catalog.py          目录镜像两端用法演示
 ```
 
 ## 2. 阶段状态机
@@ -238,6 +241,83 @@ bill = r.settle_storage_costs(
   分摊——不按秒展开，工作量不随秒数或“计量段数 × 活跃中心数”增长；
   字节秒中间总量可超 SQLite 64 位整数（TEXT 暂存 + Python 大整数）。
 
+## 7d. 目录镜像（`Reclaimer.catalog_*` / `CatalogMirror`）
+
+盘点服务把对象目录留在自己的 SQLite 库里，按 `(object_id, version)`
+离线查询，不必每次连接回收主库，也不必每天搬全表。镜像只含 `objects`
+的目录字段（含已回收版本与回收时间）；**不复制**对象文件、计划、谱系、
+质量隔离或账单。三种查询结果严格区分：未登记 `UNKNOWN`、仍存活
+`LIVE`、已回收 `RECYCLED`。
+
+### 主库变更序列（随库升级、跨进程保持）
+
+主库新增 `catalog_batches` / `catalog_changes` 与单行 `catalog_source`：
+
+- **批次**只由两个目录写入口产生，且变更与目录写入在**同一事务**生效：
+  - `import_objects` 成功写入的新行 → 一个 `IMPORT` 批（同一次批量导入
+    的新增行同批；批内按 `(object_id, version)` 排序）；
+  - 回收执行器成功提交的目录状态变化 → 单行 `RECYCLE` 批。
+- 批次号在写事务内按 `MAX+1` 分配，回滚不留痕，因此已提交批次在同一
+  主库内**按提交顺序从 1 连续编号**（不用业务时间或版本号当进度）。
+- 完全重复的导入、失败回滚、没改变目录的重试（如重复执行已完成计划）
+  都不产生新批；以 SQLite 提交的目录状态为准，后端文件删除动作与日志
+  不算目录变更。
+- `catalog_source` 是随重开保持的来源标识。旧版本数据库打开即升级：
+  只补建变更表与来源标识，**不倒推**升级前的旧变更——升级前的对象与
+  墓碑通过首次完整交付进入镜像。
+- `catalog_changes` 保存每批写入后的完整目录行（非 diff），保留历史
+  所需存储随写入量增长。
+
+### 两种交付（Python 接口，流式分块，无网络/通用格式依赖）
+
+```python
+r = Reclaimer.open("primary.db", backend=MemoryBackend())
+mirror = Reclaimer.open_catalog_mirror("mirror.db")
+
+# 完整交付：来源标识 + 基准批次号 + 全量目录，取自同一个已提交快照
+with r.open_full_catalog_delivery() as full:
+    full.header              # kind/source_id/baseline_batch/row_count
+    for chunk in full.iter_chunks(chunk_size=1000):  # keyset 分页，不整表入内存
+        ...
+    mirror.receive_full(full, chunk_size=1000)       # 收齐判断：行数 + SHA-256 摘要
+
+# 增量交付：批次号窗口 (after_batch, after_batch+max_batches]，整批不拆
+with r.open_incremental_catalog_delivery(after_batch=3, max_batches=10) as inc:
+    inc.header   # source_id / after_batch / start_batch / end_batch /
+                 # total_rows / batches(各批 change_kind 与 row_count)
+    for piece in inc.iter_chunks(chunk_size=1000):   # 大批可切块，块末带批摘要
+        ...
+    mirror.receive_incremental(inc, chunk_size=1000)
+```
+
+- 首次交付的基准号与全量目录取自**同一快照事务**（文件库用独立只读
+  连接，读取期间主库继续写入不影响交付），之后增量能从该号码接上；
+  一个已生成的交付在源表继续变化后仍以当时内容为准。
+- 小增量只按批次号做索引范围扫描，不回扫未变化的旧目录、不从头读
+  变更历史；首次/很大的单次导入都按块传递与落盘。
+
+### 镜像接收与查询语义
+
+- 空镜像必须先收到完整交付才能查询（否则抛
+  `MirrorNotInitializedError`）；查询直接读镜像表，不重放日志。
+- 来源不同、缺批、批内缺行、与已应用且仍可重放的同编号批内容不符，
+  一律抛 `CatalogDeliveryError` 且**不推进**；完全相同的已收批允许
+  重发，交付可含已收前缀 + 紧随其后的新批。
+- **基准批次及之前不在可重放范围**：历史批次从未进入镜像，不能当作
+  可核验的重发；重基线（再次完整交付）会清空旧重放历史。
+- 一次交付的目录结果与进度在同一事务落地；坏包或写入中断后重开，
+  只能看到此前的完整视图（暂存区每次打开即清空）；另一连接不会看到
+  删掉旧状态却没写齐新状态、或只更新一半的导入批。
+- “已提交但答复未送达”时重发不重复生效：已收批逐行核验后只标记
+  重放，目录 UPSERT 与进度都不重复推进。
+
+```python
+mirror.object_status("orders", 1)
+# LIVE     -> 存活目录行（层、payload_ref 等）
+# RECYCLED -> 保留的已回收版本 + recycled_at + recycled_by_plan
+# UNKNOWN  -> 身份从未进入目录（与“已回收”严格区分）
+```
+
 
 ## 8. 测试方法
 
@@ -245,15 +325,19 @@ bill = r.settle_storage_costs(
 # 106 项断言（-I 隔离模式，不信任工作目录中的模块）
 python3 -I tests/test_reclaimer.py
 
-# 132 项质量隔离断言（含独立逐分区参考模型）
+# 136 项质量隔离断言（含独立逐分区参考模型）
 python3 -I tests/test_quality_view.py
 
-# 82 项结算断言（手算跨回收账单 + 按秒独立核算 + 高共享度精确核对）
+# 86 项结算断言（手算跨回收账单 + 按秒独立核算 + 高共享度精确核对）
 python3 -I tests/test_settlement.py
 
-# 端到端演示：回收计划器 / 质量隔离视图
+# 121 项目录镜像断言（变更序列/交付/坏包/崩溃/并发/性能证据）
+python3 -I tests/test_catalog_mirror.py
+
+# 端到端演示：回收计划器 / 质量隔离视图 / 目录镜像
 python3 -I tests/demo.py
 python3 -I tests/demo_quality.py
+python3 -I tests/demo_catalog.py
 ```
 
 ### 手工场景（tests/scenario.py）
@@ -316,3 +400,29 @@ raw_c v1（孤立对象，public 短保留期规则命中）
 `tests/demo_quality.py` 用小坐标把每个版本逐分区展开（`X` = 必须避开），
 演示报障、重复投递、同编号换载荷、解除未知编号、部分解封、全部解除后与
 参考模型一致，以及写到一半失败后重开仍读旧结果。
+
+### 目录镜像测试（tests/test_catalog_mirror.py）
+
+- `test_batch_semantics`：同批新增共享批次号、批内序号连续；重复导入/
+  失败回滚/无目录变化的重试不产批；批次号从 1 连续无空洞；
+- `test_source_id_and_upgrade`：旧库（只有 `objects`）打开即升级，补
+  来源标识且不倒推旧变更，标识随重开保持；
+- `test_concurrent_commit_during_full_delivery`：首次交付读取期间另一
+  连接提交导入，交付冻结在快照、基准号之后接增量不漏不重，同批重发幂等；
+- `test_recycle_keeps_version_with_recycled_at`：回收旧版本后镜像保留
+  该版本并可见回收时间与计划，同对象新版本仍 LIVE，未登记身份 UNKNOWN；
+- `test_bad_deliveries_never_advance`：来源不同、缺批、批内缺行、同号
+  批内容不符、基准前历史批误重放、截断完整交付全部拒绝且进度不动；
+- `test_interrupted_write_reopen_and_full_recovery`：写入中断后同连接
+  与重开新进程都只见旧完整视图，随后完整交付恢复且重发幂等；
+- `test_reader_never_sees_half_applied_state`：独立连接在分块落盘期间
+  始终只见旧视图、提交后只见新视图，并发压力下无错误、无中间行数；
+- `test_runtime_oracle_statuses`：运行时小样本用独立字典推导每个版本
+  的应见状态并逐行核对，断开主库后镜像仍独立可查；
+- `test_incremental_does_not_scan_old_catalog`：5 万行老目录下，用
+  trace、EXPLAIN QUERY PLAN、虚拟机步数与计时四类可复跑证据证明小增量
+  不访问 `objects`、只走变更表索引（实测增量约 1ms vs 全量约 390ms）；
+- `test_large_batch_chunked_delivery`：3000 行大批按有界块传递落盘，
+  批末摘要、批内序号连续；
+- `test_in_memory_delivery_and_window_limits`：内存库交付、`max_batches`
+  窗口边界、空增量、含已收前缀交付的重放语义。

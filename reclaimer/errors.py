@@ -65,3 +65,7 @@ class SettlementError(ReclaimerError):
     未知版本、同版本重复归属、引用与计量同时有效时缺失归属。任何错误
     都使整次结算失败：不返回半张账单，也不改写业务表。
     """
+
+
+class MirrorNotInitializedError(ReclaimerError):
+    """镜像尚未收到完整首次交付，不能提供目录查询。"""

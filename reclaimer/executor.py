@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import time
 
+from . import catalog
 from .errors import PlanNotExecutableError, PlanPausedError
 from .planner import EV_RECYCLE_PROOF
 from .precheck import Precheck
@@ -286,6 +287,14 @@ class Executor:
                 (now, "OBJECT_RECYCLED", plan_id, object_id, version,
                  f"layer={record['storage_layer']}"),
             )
+            # 目录镜像变更序列：以 SQLite 提交的目录状态为准，与墓碑/状态
+            # 同事务生效。后端文件删除本身不构成目录变更；幂等恢复路径
+            # （上面 lifecycle 已为 RECYCLED 时提前 return）不会重复产生批次。
+            catalog_row = catalog.read_catalog_row(
+                self.conn, object_id, version)
+            catalog.append_recycle_change(
+                self.conn, catalog.next_batch_no(self.conn), now,
+                catalog_row)
             self._cascade_refcounts(plan_id, object_id, version, now)
 
     def _cascade_refcounts(self, plan_id, object_id, version, now):

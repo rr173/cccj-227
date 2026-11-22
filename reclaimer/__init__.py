@@ -15,6 +15,14 @@
 """
 
 from .api import Reclaimer
+from .catalog import (
+    CatalogDeliveryError,
+    CatalogMirror,
+    CatalogProducer,
+    FullDelivery,
+    IncrementalDelivery,
+)
+from .errors import MirrorNotInitializedError
 from .quality import (
     QUALITY_AVAILABLE,
     QUALITY_NO_VIEW,
@@ -23,5 +31,8 @@ from .quality import (
 )
 
 __all__ = ["Reclaimer", "QualityView", "QUALITY_AVAILABLE",
-           "QUALITY_RECYCLED", "QUALITY_NO_VIEW"]
+           "QUALITY_RECYCLED", "QUALITY_NO_VIEW",
+           "CatalogMirror", "CatalogProducer", "FullDelivery",
+           "IncrementalDelivery", "CatalogDeliveryError",
+           "MirrorNotInitializedError"]
 __version__ = "1.0.0"

@@ -19,7 +19,7 @@ import time
 import uuid
 from typing import Iterable
 
-from . import hashing
+from . import catalog, hashing
 from .errors import (
     LineageValidationError,
     PolicyValidationError,
@@ -38,37 +38,71 @@ class Importer:
 
     # ------------------------------------------------------------ 对象
     def import_objects(self, objects: Iterable[dict]) -> int:
-        """批量导入对象。已存在的同身份同版本行被忽略（不可变）。"""
+        """批量导入对象。已存在的同身份同版本行被忽略（不可变）。
+
+        目录写入与镜像变更序列在**同一事务**生效：只有实际新增的行进入
+        一个新 IMPORT 批次；完全重复的导入不产生批次。任何校验失败都回滚
+        整个事务，不留半批。
+        """
         n = 0
-        for o in objects:
-            self._validate_object(o)
-            cur = self.conn.execute(
-                "SELECT lifecycle FROM objects WHERE object_id=? AND version=?",
-                (o["object_id"], int(o["version"])),
-            ).fetchone()
-            if cur is not None:
-                if cur[0] == OBJ_RECYCLED:
-                    # 墓碑终态：绝不允许通过重新导入复活
-                    raise LineageValidationError(
-                        f"{o['object_id']} v{o['version']} already recycled; "
-                        "re-import cannot revive it"
+        try:
+            with self.conn:
+                inserted: list[tuple] = []
+                for o in objects:
+                    self._validate_object(o)
+                    cur = self.conn.execute(
+                        "SELECT lifecycle FROM objects "
+                        "WHERE object_id=? AND version=?",
+                        (o["object_id"], int(o["version"])),
+                    ).fetchone()
+                    if cur is not None:
+                        if cur[0] == OBJ_RECYCLED:
+                            # 墓碑终态：绝不允许通过重新导入复活
+                            raise LineageValidationError(
+                                f"{o['object_id']} v{o['version']} already "
+                                "recycled; re-import cannot revive it"
+                            )
+                        continue
+                    row = self.conn.execute(
+                        """INSERT INTO objects(object_id, version, obj_type,
+                               classification, environment, storage_layer,
+                               created_at, lifecycle, payload_ref)
+                           VALUES(?,?,?,?,?,?,?,'LIVE',?)
+                           RETURNING object_id, version, obj_type,
+                               classification, environment, storage_layer,
+                               created_at, lifecycle, recycled_at,
+                               recycled_by_plan, payload_ref""",
+                        (
+                            o["object_id"], int(o["version"]), o["obj_type"],
+                            o["classification"], o["environment"],
+                            o["storage_layer"], int(o["created_at"]),
+                            o.get("payload_ref"),
+                        ),
+                    ).fetchone()
+                    inserted.append(tuple(row))
+                n = len(inserted)
+                if n > 0:
+                    # 目录变更批次：保存提交后的完整目录行，与目录同事务；
+                    # 批内按 (object_id, version) 排序，序号确定且可复跑
+                    inserted.sort(key=lambda row: (row[0], row[1]))
+                    batch_no = catalog.next_batch_no(self.conn)
+                    self.conn.execute(
+                        "INSERT INTO catalog_batches(batch_no, change_kind, "
+                        "committed_at, row_count) VALUES(?, 'IMPORT', ?, ?)",
+                        (batch_no, int(self._clock()), n),
                     )
-                continue
-            self.conn.execute(
-                """INSERT INTO objects(object_id, version, obj_type,
-                       classification, environment, storage_layer,
-                       created_at, lifecycle, payload_ref)
-                   VALUES(?,?,?,?,?,?,?,'LIVE',?)""",
-                (
-                    o["object_id"], int(o["version"]), o["obj_type"],
-                    o["classification"], o["environment"],
-                    o["storage_layer"], int(o["created_at"]),
-                    o.get("payload_ref"),
-                ),
-            )
-            n += 1
-        self.conn.commit()
-        return n
+                    self.conn.executemany(
+                        f"""INSERT INTO catalog_changes(batch_no, seq_in_batch,
+                               {", ".join(catalog.CATALOG_COLUMNS)})
+                           VALUES(?, ?, {", ".join("?" * len(catalog.CATALOG_COLUMNS))})""",
+                        [(batch_no, seq, *row)
+                         for seq, row in enumerate(inserted)],
+                    )
+            return n
+        except Exception:
+            # 显式回滚，保证失败调用后连接上不留未提交目录写入
+            self.conn.rollback()
+            raise
 
     @staticmethod
     def _validate_object(o: dict) -> None:
